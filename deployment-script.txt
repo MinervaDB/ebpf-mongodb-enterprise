@@ -1,0 +1,1084 @@
+#!/usr/bin/env bash
+# MongoDB eBPF Monitoring Infrastructure Deployment Script
+# -------------------------------------------------------
+# This script deploys the entire MongoDB eBPF monitoring infrastructure,
+# including eBPF agents, Prometheus, Grafana, and alerting components.
+#
+# Usage: ./deploy-mongodb-monitoring.sh [options]
+#
+# Options:
+#   --mongo-uri=URI       MongoDB connection URI (default: mongodb://localhost:27017)
+#   --prometheus-port=N   Port for Prometheus HTTP server (default: 9090)
+#   --grafana-port=N      Port for Grafana server (default: 3000)
+#   --output-dir=DIR      Directory for metrics and logs (default: /var/log/mongodb_metrics)
+#   --config-dir=DIR      Directory for configuration files (default: /etc/mongodb_monitoring)
+#   --docker              Deploy using Docker containers
+#   --kubernetes          Deploy on Kubernetes (requires kubectl)
+#   --skip-prometheus     Skip Prometheus installation
+#   --skip-grafana        Skip Grafana installation
+#   --with-alertmanager   Deploy Prometheus AlertManager
+#   --help                Display this help message
+#
+# Examples:
+#   ./deploy-mongodb-monitoring.sh --mongo-uri=mongodb://user:pass@db.example.com:27017
+#   ./deploy-mongodb-monitoring.sh --docker --with-alertmanager
+#   ./deploy-mongodb-monitoring.sh --kubernetes --output-dir=/mnt/data/mongodb_metrics
+
+set -e
+
+# Default values
+MONGO_URI="mongodb://localhost:27017"
+PROMETHEUS_PORT=9090
+GRAFANA_PORT=3000
+OUTPUT_DIR="/var/log/mongodb_metrics"
+CONFIG_DIR="/etc/mongodb_monitoring"
+DEPLOY_MODE="native"
+SKIP_PROMETHEUS=false
+SKIP_GRAFANA=false
+WITH_ALERTMANAGER=false
+
+# Parse command line arguments
+for arg in "$@"; do
+    case $arg in
+        --mongo-uri=*)
+            MONGO_URI="${arg#*=}"
+            shift
+            ;;
+        --prometheus-port=*)
+            PROMETHEUS_PORT="${arg#*=}"
+            shift
+            ;;
+        --grafana-port=*)
+            GRAFANA_PORT="${arg#*=}"
+            shift
+            ;;
+        --output-dir=*)
+            OUTPUT_DIR="${arg#*=}"
+            shift
+            ;;
+        --config-dir=*)
+            CONFIG_DIR="${arg#*=}"
+            shift
+            ;;
+        --docker)
+            DEPLOY_MODE="docker"
+            shift
+            ;;
+        --kubernetes)
+            DEPLOY_MODE="kubernetes"
+            shift
+            ;;
+        --skip-prometheus)
+            SKIP_PROMETHEUS=true
+            shift
+            ;;
+        --skip-grafana)
+            SKIP_GRAFANA=true
+            shift
+            ;;
+        --with-alertmanager)
+            WITH_ALERTMANAGER=true
+            shift
+            ;;
+        --help)
+            echo "MongoDB eBPF Monitoring Infrastructure Deployment Script"
+            echo "-------------------------------------------------------"
+            echo "This script deploys the entire MongoDB eBPF monitoring infrastructure,"
+            echo "including eBPF agents, Prometheus, Grafana, and alerting components."
+            echo ""
+            echo "Usage: ./deploy-mongodb-monitoring.sh [options]"
+            echo ""
+            echo "Options:"
+            echo "  --mongo-uri=URI       MongoDB connection URI (default: mongodb://localhost:27017)"
+            echo "  --prometheus-port=N   Port for Prometheus HTTP server (default: 9090)"
+            echo "  --grafana-port=N      Port for Grafana server (default: 3000)"
+            echo "  --output-dir=DIR      Directory for metrics and logs (default: /var/log/mongodb_metrics)"
+            echo "  --config-dir=DIR      Directory for configuration files (default: /etc/mongodb_monitoring)"
+            echo "  --docker              Deploy using Docker containers"
+            echo "  --kubernetes          Deploy on Kubernetes (requires kubectl)"
+            echo "  --skip-prometheus     Skip Prometheus installation"
+            echo "  --skip-grafana        Skip Grafana installation"
+            echo "  --with-alertmanager   Deploy Prometheus AlertManager"
+            echo "  --help                Display this help message"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            echo "Use --help for usage information."
+            exit 1
+            ;;
+    esac
+done
+
+# Check if running as root
+if [ "$(id -u)" -ne 0 ] && [ "$DEPLOY_MODE" = "native" ]; then
+    echo "This script must be run as root for native deployment. Try using sudo."
+    exit 1
+fi
+
+# Function to print section headers
+print_section() {
+    echo ""
+    echo "=============================="
+    echo "  $1"
+    echo "=============================="
+}
+
+# Create necessary directories
+create_directories() {
+    print_section "Creating Directories"
+    
+    mkdir -p "$OUTPUT_DIR"/{logs,reports,alerts,data}
+    mkdir -p "$CONFIG_DIR"/{prometheus,grafana,alertmanager,agent}
+    
+    echo "✓ Directories created"
+}
+
+# Check prerequisites based on deployment mode
+check_prerequisites() {
+    print_section "Checking Prerequisites"
+    
+    case $DEPLOY_MODE in
+        native)
+            # Create systemd service for eBPF agent
+            cat > /etc/systemd/system/mongodb-ebpf-monitor.service << EOF
+[Unit]
+Description=MongoDB eBPF Monitoring Agent
+After=network.target mongodb.service
+Wants=mongodb.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 $CONFIG_DIR/agent/ebpf-mongodb-monitoring.py --uri=$MONGO_URI --output=$OUTPUT_DIR
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+LimitNPROC=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+            # Enable and start the service
+            systemctl daemon-reload
+            systemctl enable mongodb-ebpf-monitor.service
+            systemctl start mongodb-ebpf-monitor.service
+            
+            echo "✓ eBPF agent deployed as a systemd service"
+            ;;
+            
+        docker)
+            # Create Docker Compose file for eBPF agent
+            cat > "$CONFIG_DIR/agent/docker-compose.yml" << EOF
+version: '3'
+
+services:
+  mongodb-ebpf-agent:
+    image: ubuntu:latest
+    privileged: true
+    pid: host
+    network_mode: host
+    volumes:
+      - /sys:/sys:ro
+      - /usr/src:/usr/src:ro
+      - /lib/modules:/lib/modules:ro
+      - $CONFIG_DIR/agent:/app
+      - $OUTPUT_DIR:/output
+    command: >
+      bash -c "apt-get update && 
+               apt-get install -y python3 python3-pip bpfcc-tools linux-headers-\$(uname -r) &&
+               pip3 install bcc pymongo psutil pandas prometheus_client matplotlib requests &&
+               python3 /app/ebpf-mongodb-monitoring.py --uri=$MONGO_URI --output=/output"
+    restart: unless-stopped
+EOF
+
+            # Start Docker container
+            cd "$CONFIG_DIR/agent"
+            docker-compose up -d
+            
+            echo "✓ eBPF agent deployed as a Docker container"
+            ;;
+            
+        kubernetes)
+            # Create Kubernetes ConfigMap
+            cat > "$CONFIG_DIR/agent/ebpf-agent-configmap.yaml" << EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongodb-ebpf-agent-config
+data:
+  mongo-uri: "$MONGO_URI"
+EOF
+
+            # Create Kubernetes DaemonSet
+            cat > "$CONFIG_DIR/agent/ebpf-agent-daemonset.yaml" << EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mongodb-ebpf-agent
+  labels:
+    app: mongodb-ebpf-agent
+spec:
+  selector:
+    matchLabels:
+      app: mongodb-ebpf-agent
+  template:
+    metadata:
+      labels:
+        app: mongodb-ebpf-agent
+    spec:
+      hostPID: true
+      containers:
+      - name: mongodb-ebpf-agent
+        image: ubuntu:latest
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: sys
+          mountPath: /sys
+          readOnly: true
+        - name: modules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: src
+          mountPath: /usr/src
+          readOnly: true
+        - name: output
+          mountPath: /output
+        command:
+        - bash
+        - -c
+        - |
+          apt-get update && \\
+          apt-get install -y python3 python3-pip bpfcc-tools linux-headers-\$(uname -r) && \\
+          pip3 install bcc pymongo psutil pandas prometheus_client matplotlib requests && \\
+          python3 -c "$(cat /app/ebpf-mongodb-monitoring.py)" --uri=\$(cat /etc/config/mongo-uri) --output=/output
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/config
+        - name: agent-script
+          mountPath: /app
+      volumes:
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: modules
+        hostPath:
+          path: /lib/modules
+      - name: src
+        hostPath:
+          path: /usr/src
+      - name: output
+        hostPath:
+          path: $OUTPUT_DIR
+      - name: config-volume
+        configMap:
+          name: mongodb-ebpf-agent-config
+      - name: agent-script
+        configMap:
+          name: mongodb-ebpf-agent-script
+EOF
+
+            # Create ConfigMap for the agent script
+            kubectl create configmap mongodb-ebpf-agent-script --from-file="$CONFIG_DIR/agent/ebpf-mongodb-monitoring.py"
+            
+            # Apply Kubernetes configurations
+            kubectl apply -f "$CONFIG_DIR/agent/ebpf-agent-configmap.yaml"
+            kubectl apply -f "$CONFIG_DIR/agent/ebpf-agent-daemonset.yaml"
+            
+            echo "✓ eBPF agent deployed as a Kubernetes DaemonSet"
+            ;;
+    esac
+}
+
+# Deploy Prometheus
+deploy_prometheus() {
+    if [ "$SKIP_PROMETHEUS" = true ]; then
+        echo "Skipping Prometheus deployment as requested."
+        return
+    fi
+    
+    print_section "Deploying Prometheus"
+    
+    # Create Prometheus configuration
+    cat > "$CONFIG_DIR/prometheus/prometheus.yml" << EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+  - static_configs:
+    - targets: ['localhost:9093']
+
+rule_files:
+  - "$CONFIG_DIR/prometheus/rules/*.yml"
+
+scrape_configs:
+  - job_name: 'mongodb_ebpf'
+    static_configs:
+      - targets: ['localhost:8000']
+        labels:
+          service: 'mongodb'
+          environment: 'production'
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+EOF
+
+    # Create alerts directory and sample alert rules
+    mkdir -p "$CONFIG_DIR/prometheus/rules"
+    
+    cat > "$CONFIG_DIR/prometheus/rules/mongodb_alerts.yml" << EOF
+groups:
+- name: mongodb_alerts
+  rules:
+  - alert: MongoDBHighQueryLatency
+    expr: histogram_quantile(0.95, sum(rate(mongodb_query_duration_seconds_bucket[5m])) by (le)) > 0.5
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High query latency (instance {{ \$labels.instance }})"
+      description: "MongoDB 95th percentile query latency is high (> 500ms) for more than 5 minutes."
+
+  - alert: MongoDBHighIOLatency
+    expr: histogram_quantile(0.95, sum(rate(mongodb_io_latency_seconds_bucket[5m])) by (le)) > 0.1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High I/O latency (instance {{ \$labels.instance }})"
+      description: "MongoDB 95th percentile I/O latency is high (> 100ms) for more than 5 minutes."
+
+  - alert: MongoDBQueryEfficiencyLow
+    expr: sum(rate(mongodb_docs_examined_total[5m])) / sum(rate(mongodb_docs_returned_total[5m])) > 50
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Low query efficiency (instance {{ \$labels.instance }})"
+      description: "MongoDB is examining over 50 documents for each document returned over the last 15 minutes."
+
+  - alert: MongoDBHighConnectionUtilization
+    expr: mongodb_connections{state="current"} / mongodb_connections{state="available"} * 100 > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High connection utilization (instance {{ \$labels.instance }})"
+      description: "MongoDB connection utilization is over 80% for more than 5 minutes."
+
+  - alert: MongoDBReplicationLagHigh
+    expr: mongodb_replication_lag_seconds > 60
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High replication lag (instance {{ \$labels.instance }})"
+      description: "MongoDB replication lag is over 60 seconds for more than 5 minutes."
+
+  - alert: MongoDBProcessDown
+    expr: absent(mongodb_instance_info)
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "MongoDB process is down (instance {{ \$labels.instance }})"
+      description: "MongoDB process appears to be down."
+EOF
+
+    case $DEPLOY_MODE in
+        native)
+            # Download and install Prometheus
+            PROMETHEUS_VERSION="2.45.0"
+            
+            cd /tmp
+            wget -q https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz
+            tar xfz prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz
+            
+            # Copy binaries
+            cp prometheus-${PROMETHEUS_VERSION}.linux-amd64/prometheus /usr/local/bin/
+            cp prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool /usr/local/bin/
+            
+            # Create Prometheus service
+            cat > /etc/systemd/system/prometheus.service << EOF
+[Unit]
+Description=Prometheus Time Series Collection and Processing Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \\
+    --config.file=$CONFIG_DIR/prometheus/prometheus.yml \\
+    --storage.tsdb.path=$OUTPUT_DIR/data/prometheus \\
+    --web.console.templates=/etc/prometheus/consoles \\
+    --web.console.libraries=/etc/prometheus/console_libraries \\
+    --web.listen-address=0.0.0.0:$PROMETHEUS_PORT \\
+    --web.enable-lifecycle
+
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+            # Create user and set permissions
+            if ! id -u prometheus &>/dev/null; then
+                useradd --no-create-home --shell /bin/false prometheus
+            fi
+            
+            mkdir -p $OUTPUT_DIR/data/prometheus
+            chown -R prometheus:prometheus $OUTPUT_DIR/data/prometheus
+            chown -R prometheus:prometheus $CONFIG_DIR/prometheus
+            
+            # Enable and start the service
+            systemctl daemon-reload
+            systemctl enable prometheus.service
+            systemctl start prometheus.service
+            
+            echo "✓ Prometheus deployed as a systemd service"
+            ;;
+            
+        docker)
+            # Create Docker Compose file for Prometheus
+            cat > "$CONFIG_DIR/prometheus/docker-compose.yml" << EOF
+version: '3'
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - $CONFIG_DIR/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - $CONFIG_DIR/prometheus/rules:/etc/prometheus/rules
+      - $OUTPUT_DIR/data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.listen-address=0.0.0.0:$PROMETHEUS_PORT'
+      - '--web.enable-lifecycle'
+    ports:
+      - $PROMETHEUS_PORT:$PROMETHEUS_PORT
+    restart: unless-stopped
+EOF
+
+            # Start Docker container
+            cd "$CONFIG_DIR/prometheus"
+            docker-compose up -d
+            
+            echo "✓ Prometheus deployed as a Docker container"
+            ;;
+            
+        kubernetes)
+            # Create Kubernetes ConfigMap for Prometheus config
+            kubectl create configmap prometheus-config --from-file="$CONFIG_DIR/prometheus/prometheus.yml"
+            kubectl create configmap prometheus-rules --from-file="$CONFIG_DIR/prometheus/rules"
+            
+            # Create Kubernetes Deployment
+            cat > "$CONFIG_DIR/prometheus/prometheus-deployment.yaml" << EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+      - name: prometheus
+        image: prom/prometheus:latest
+        args:
+          - "--config.file=/etc/prometheus/prometheus.yml"
+          - "--storage.tsdb.path=/prometheus"
+          - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+          - "--web.console.templates=/usr/share/prometheus/consoles"
+          - "--web.enable-lifecycle"
+        ports:
+        - containerPort: $PROMETHEUS_PORT
+        volumeMounts:
+        - name: prometheus-config
+          mountPath: /etc/prometheus/prometheus.yml
+          subPath: prometheus.yml
+        - name: prometheus-rules
+          mountPath: /etc/prometheus/rules
+        - name: prometheus-storage
+          mountPath: /prometheus
+      volumes:
+      - name: prometheus-config
+        configMap:
+          name: prometheus-config
+      - name: prometheus-rules
+        configMap:
+          name: prometheus-rules
+      - name: prometheus-storage
+        persistentVolumeClaim:
+          claimName: prometheus-storage
+EOF
+
+            # Create PVC for Prometheus
+            cat > "$CONFIG_DIR/prometheus/prometheus-pvc.yaml" << EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+EOF
+
+            # Create Service for Prometheus
+            cat > "$CONFIG_DIR/prometheus/prometheus-service.yaml" << EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - port: $PROMETHEUS_PORT
+    targetPort: $PROMETHEUS_PORT
+  type: ClusterIP
+EOF
+
+            # Apply Kubernetes configurations
+            kubectl apply -f "$CONFIG_DIR/prometheus/prometheus-pvc.yaml"
+            kubectl apply -f "$CONFIG_DIR/prometheus/prometheus-deployment.yaml"
+            kubectl apply -f "$CONFIG_DIR/prometheus/prometheus-service.yaml"
+            
+            echo "✓ Prometheus deployed on Kubernetes"
+            ;;
+    esac
+    
+    if [ "$WITH_ALERTMANAGER" = true ]; then
+        deploy_alertmanager
+    fi
+}
+
+# Deploy AlertManager if requested
+deploy_alertmanager() {
+    print_section "Deploying Prometheus AlertManager"
+    
+    # Create AlertManager configuration
+    mkdir -p "$CONFIG_DIR/alertmanager"
+    
+    cat > "$CONFIG_DIR/alertmanager/alertmanager.yml" << EOF
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ['alertname', 'instance', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 1h
+  receiver: 'default-receiver'
+  routes:
+  - match:
+      severity: critical
+    receiver: 'critical-receiver'
+    continue: true
+
+receivers:
+- name: 'default-receiver'
+  email_configs:
+  - to: 'alerts@example.com'
+    from: 'alertmanager@example.com'
+    smarthost: 'smtp.example.com:587'
+    auth_username: 'alertmanager@example.com'
+    auth_password: 'your-password'
+    send_resolved: true
+    
+- name: 'critical-receiver'
+  webhook_configs:
+  - url: 'https://hooks.slack.com/services/your-webhook-url'
+    send_resolved: true
+EOF
+
+    case $DEPLOY_MODE in
+        native)
+            # Download and install AlertManager
+            ALERTMANAGER_VERSION="0.25.0"
+            
+            cd /tmp
+            wget -q https://github.com/prometheus/alertmanager/releases/download/v${ALERTMANAGER_VERSION}/alertmanager-${ALERTMANAGER_VERSION}.linux-amd64.tar.gz
+            tar xfz alertmanager-${ALERTMANAGER_VERSION}.linux-amd64.tar.gz
+            
+            # Copy binaries
+            cp alertmanager-${ALERTMANAGER_VERSION}.linux-amd64/alertmanager /usr/local/bin/
+            cp alertmanager-${ALERTMANAGER_VERSION}.linux-amd64/amtool /usr/local/bin/
+            
+            # Create AlertManager service
+            cat > /etc/systemd/system/alertmanager.service << EOF
+[Unit]
+Description=Prometheus AlertManager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/alertmanager \\
+    --config.file=$CONFIG_DIR/alertmanager/alertmanager.yml \\
+    --storage.path=$OUTPUT_DIR/data/alertmanager \\
+    --web.listen-address=:9093
+
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+            # Create directories and set permissions
+            mkdir -p $OUTPUT_DIR/data/alertmanager
+            chown -R prometheus:prometheus $OUTPUT_DIR/data/alertmanager
+            chown -R prometheus:prometheus $CONFIG_DIR/alertmanager
+            
+            # Enable and start the service
+            systemctl daemon-reload
+            systemctl enable alertmanager.service
+            systemctl start alertmanager.service
+            
+            echo "✓ AlertManager deployed as a systemd service"
+            ;;
+            
+        docker)
+            # Create Docker Compose file for AlertManager
+            cat > "$CONFIG_DIR/alertmanager/docker-compose.yml" << EOF
+version: '3'
+
+services:
+  alertmanager:
+    image: prom/alertmanager:latest
+    volumes:
+      - $CONFIG_DIR/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - $OUTPUT_DIR/data/alertmanager:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    ports:
+      - 9093:9093
+    restart: unless-stopped
+EOF
+
+            # Start Docker container
+            cd "$CONFIG_DIR/alertmanager"
+            docker-compose up -d
+            
+            echo "✓ AlertManager deployed as a Docker container"
+            ;;
+            
+        kubernetes)
+            # Create Kubernetes ConfigMap for AlertManager config
+            kubectl create configmap alertmanager-config --from-file="$CONFIG_DIR/alertmanager/alertmanager.yml"
+            
+            # Create Kubernetes Deployment
+            cat > "$CONFIG_DIR/alertmanager/alertmanager-deployment.yaml" << EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  labels:
+    app: alertmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+      - name: alertmanager
+        image: prom/alertmanager:latest
+        args:
+          - "--config.file=/etc/alertmanager/alertmanager.yml"
+          - "--storage.path=/alertmanager"
+        ports:
+        - containerPort: 9093
+        volumeMounts:
+        - name: alertmanager-config
+          mountPath: /etc/alertmanager/alertmanager.yml
+          subPath: alertmanager.yml
+        - name: alertmanager-storage
+          mountPath: /alertmanager
+      volumes:
+      - name: alertmanager-config
+        configMap:
+          name: alertmanager-config
+      - name: alertmanager-storage
+        persistentVolumeClaim:
+          claimName: alertmanager-storage
+EOF
+
+            # Create PVC for AlertManager
+            cat > "$CONFIG_DIR/alertmanager/alertmanager-pvc.yaml" << EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alertmanager-storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+EOF
+
+            # Create Service for AlertManager
+            cat > "$CONFIG_DIR/alertmanager/alertmanager-service.yaml" << EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+spec:
+  selector:
+    app: alertmanager
+  ports:
+  - port: 9093
+    targetPort: 9093
+  type: ClusterIP
+EOF
+
+            # Apply Kubernetes configurations
+            kubectl apply -f "$CONFIG_DIR/alertmanager/alertmanager-pvc.yaml"
+            kubectl apply -f "$CONFIG_DIR/alertmanager/alertmanager-deployment.yaml"
+            kubectl apply -f "$CONFIG_DIR/alertmanager/alertmanager-service.yaml"
+            
+            echo "✓ AlertManager deployed on Kubernetes"
+            ;;
+    esac
+}
+
+# Deploy Grafana
+deploy_grafana() {
+    if [ "$SKIP_GRAFANA" = true ]; then
+        echo "Skipping Grafana deployment as requested."
+        return
+    fi
+    
+    print_section "Deploying Grafana"
+    
+    # Create Grafana datasource configuration
+    mkdir -p "$CONFIG_DIR/grafana/provisioning/datasources"
+    mkdir -p "$CONFIG_DIR/grafana/provisioning/dashboards"
+    
+    cat > "$CONFIG_DIR/grafana/provisioning/datasources/prometheus.yml" << EOF
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:$PROMETHEUS_PORT
+    isDefault: true
+    editable: false
+EOF
+    
+    # Copy dashboard configuration
+    cp dashboard.txt "$CONFIG_DIR/grafana/provisioning/dashboards/mongodb_dashboard.yml"
+    
+    case $DEPLOY_MODE in
+        native)
+            # Install Grafana from repository
+            apt-get install -y apt-transport-https software-properties-common
+            add-apt-repository "deb https://packages.grafana.com/oss/deb stable main"
+            wget -q -O - https://packages.grafana.com/gpg.key | apt-key add -
+            apt-get update
+            apt-get install -y grafana
+            
+            # Configure Grafana
+            sed -i "s|;http_port = 3000|http_port = $GRAFANA_PORT|g" /etc/grafana/grafana.ini
+            sed -i "s|;provisioning = /etc/grafana/provisioning|provisioning = $CONFIG_DIR/grafana/provisioning|g" /etc/grafana/grafana.ini
+            
+            # Enable and start Grafana
+            systemctl daemon-reload
+            systemctl enable grafana-server
+            systemctl start grafana-server
+            
+            echo "✓ Grafana deployed as a systemd service"
+            ;;
+            
+        docker)
+            # Create Docker Compose file for Grafana
+            cat > "$CONFIG_DIR/grafana/docker-compose.yml" << EOF
+version: '3'
+
+services:
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - $CONFIG_DIR/grafana/provisioning:/etc/grafana/provisioning
+      - $OUTPUT_DIR/data/grafana:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_HTTP_PORT=$GRAFANA_PORT
+    ports:
+      - $GRAFANA_PORT:$GRAFANA_PORT
+    restart: unless-stopped
+EOF
+
+            # Start Docker container
+            cd "$CONFIG_DIR/grafana"
+            docker-compose up -d
+            
+            echo "✓ Grafana deployed as a Docker container"
+            ;;
+            
+        kubernetes)
+            # Create Kubernetes ConfigMaps for Grafana
+            kubectl create configmap grafana-datasources --from-file="$CONFIG_DIR/grafana/provisioning/datasources"
+            kubectl create configmap grafana-dashboards --from-file="$CONFIG_DIR/grafana/provisioning/dashboards"
+            
+            # Create Kubernetes Deployment
+            cat > "$CONFIG_DIR/grafana/grafana-deployment.yaml" << EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:latest
+        ports:
+        - containerPort: $GRAFANA_PORT
+        env:
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: "admin"
+        - name: GF_USERS_ALLOW_SIGN_UP
+          value: "false"
+        - name: GF_SERVER_HTTP_PORT
+          value: "$GRAFANA_PORT"
+        volumeMounts:
+        - name: grafana-datasources
+          mountPath: /etc/grafana/provisioning/datasources
+        - name: grafana-dashboards
+          mountPath: /etc/grafana/provisioning/dashboards
+        - name: grafana-storage
+          mountPath: /var/lib/grafana
+      volumes:
+      - name: grafana-datasources
+        configMap:
+          name: grafana-datasources
+      - name: grafana-dashboards
+        configMap:
+          name: grafana-dashboards
+      - name: grafana-storage
+        persistentVolumeClaim:
+          claimName: grafana-storage
+EOF
+
+            # Create PVC for Grafana
+            cat > "$CONFIG_DIR/grafana/grafana-pvc.yaml" << EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+EOF
+
+            # Create Service for Grafana
+            cat > "$CONFIG_DIR/grafana/grafana-service.yaml" << EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+spec:
+  selector:
+    app: grafana
+  ports:
+  - port: $GRAFANA_PORT
+    targetPort: $GRAFANA_PORT
+  type: ClusterIP
+EOF
+
+            # Apply Kubernetes configurations
+            kubectl apply -f "$CONFIG_DIR/grafana/grafana-pvc.yaml"
+            kubectl apply -f "$CONFIG_DIR/grafana/grafana-deployment.yaml"
+            kubectl apply -f "$CONFIG_DIR/grafana/grafana-service.yaml"
+            
+            echo "✓ Grafana deployed on Kubernetes"
+            ;;
+    esac
+}
+
+# Print deployment summary
+print_summary() {
+    print_section "Deployment Summary"
+    
+    local prometheus_url=""
+    local grafana_url=""
+    local alertmanager_url=""
+    
+    case $DEPLOY_MODE in
+        native|docker)
+            prometheus_url="http://localhost:$PROMETHEUS_PORT"
+            grafana_url="http://localhost:$GRAFANA_PORT"
+            alertmanager_url="http://localhost:9093"
+            ;;
+        kubernetes)
+            prometheus_url="http://prometheus.$KUBE_NAMESPACE.svc:$PROMETHEUS_PORT"
+            grafana_url="http://grafana.$KUBE_NAMESPACE.svc:$GRAFANA_PORT"
+            alertmanager_url="http://alertmanager.$KUBE_NAMESPACE.svc:9093"
+            ;;
+    esac
+    
+    echo "MongoDB eBPF Monitoring Infrastructure has been deployed successfully!"
+    echo ""
+    echo "Components:"
+    echo "  • eBPF Monitoring Agent: Collecting detailed performance metrics"
+    
+    if [ "$SKIP_PROMETHEUS" != true ]; then
+        echo "  • Prometheus: $prometheus_url"
+    fi
+    
+    if [ "$WITH_ALERTMANAGER" = true ]; then
+        echo "  • AlertManager: $alertmanager_url"
+    fi
+    
+    if [ "$SKIP_GRAFANA" != true ]; then
+        echo "  • Grafana: $grafana_url (default login: admin/admin)"
+    fi
+    
+    echo ""
+    echo "Configuration directory: $CONFIG_DIR"
+    echo "Output directory: $OUTPUT_DIR"
+    echo ""
+    
+    echo "Monitoring details:"
+    echo "  • MongoDB Connection URI: $MONGO_URI"
+    echo ""
+    
+    echo "Next steps:"
+    echo "  1. Access Grafana at $grafana_url and explore the dashboards"
+    echo "  2. Configure alerting rules and notification channels"
+    echo "  3. Analyze MongoDB performance using the collected metrics"
+    echo ""
+    echo "For more information, refer to the documentation."
+}
+
+# Main execution
+main() {
+    echo "MongoDB eBPF Monitoring Infrastructure Deployment"
+    echo "================================================="
+    echo "Deployment mode: $DEPLOY_MODE"
+    echo "MongoDB URI: $MONGO_URI"
+    echo "Output directory: $OUTPUT_DIR"
+    echo "Config directory: $CONFIG_DIR"
+    echo ""
+    
+    create_directories
+    check_prerequisites
+    deploy_ebpf_agent
+    deploy_prometheus
+    deploy_grafana
+    print_summary
+}
+
+# Run the main function
+main            # Check for required tools and libraries
+            for cmd in bcc-tools python3 pip3; do
+                if ! command -v $cmd &> /dev/null; then
+                    echo "❌ $cmd is not installed. Please install it first."
+                    exit 1
+                fi
+            done
+            
+            # Check kernel version for eBPF support
+            KERNEL_VERSION=$(uname -r | cut -d. -f1,2)
+            if (( $(echo "$KERNEL_VERSION < 4.18" | bc -l) )); then
+                echo "❌ Kernel version $KERNEL_VERSION is too old. eBPF monitoring requires Linux kernel 4.18+"
+                exit 1
+            fi
+            
+            # Install required Python packages
+            echo "Installing required Python packages..."
+            pip3 install --quiet bcc pymongo psutil pandas prometheus_client matplotlib requests
+            ;;
+            
+        docker)
+            # Check for Docker
+            if ! command -v docker &> /dev/null; then
+                echo "❌ Docker is not installed. Please install Docker first."
+                exit 1
+            fi
+            
+            # Check for Docker Compose
+            if ! command -v docker-compose &> /dev/null; then
+                echo "❌ Docker Compose is not installed. Please install it first."
+                exit 1
+            fi
+            ;;
+            
+        kubernetes)
+            # Check for kubectl
+            if ! command -v kubectl &> /dev/null; then
+                echo "❌ kubectl is not installed. Please install it first."
+                exit 1
+            fi
+            
+            # Check if connected to a Kubernetes cluster
+            if ! kubectl get nodes &> /dev/null; then
+                echo "❌ Not connected to a Kubernetes cluster. Please configure kubectl."
+                exit 1
+            fi
+            ;;
+    esac
+    
+    echo "✓ All prerequisites satisfied"
+}
+
+# Deploy eBPF monitoring agent
+deploy_ebpf_agent() {
+    print_section "Deploying eBPF Monitoring Agent"
+    
+    # Copy the agent script
+    cp ./ebpf-mongodb-monitoring.py "$CONFIG_DIR/agent/"
+    chmod +x "$CONFIG_DIR/agent/ebpf-mongodb-monitoring.py"
+    
+    case $DEPLOY_MODE in
+        native)
+            
