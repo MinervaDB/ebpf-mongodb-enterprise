@@ -1,0 +1,740 @@
+apiVersion: 1
+
+providers:
+  - name: 'MongoDB eBPF Monitoring'
+    orgId: 1
+    folder: 'MongoDB Monitoring'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+
+dashboards:
+  - name: 'MongoDB Performance Overview'
+    uid: mongodb-perf-overview
+    title: 'MongoDB Performance Overview'
+    tags: ['mongodb', 'ebpf', 'performance']
+    timezone: 'browser'
+    schemaVersion: 16
+    version: 1
+    refresh: '10s'
+    
+    panels:
+      # Dashboard Header with Key Metrics
+      - title: 'MongoDB Key Metrics'
+        type: 'stat'
+        gridPos: { h: 3, w: 24, x: 0, y: 0 }
+        options:
+          colorMode: 'value'
+          graphMode: 'area'
+          justifyMode: 'auto'
+          textMode: 'auto'
+          reduceOptions:
+            calcs: ['lastNotNull']
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'mongodb_cpu_percent'
+            legendFormat: 'CPU'
+          - expr: 'mongodb_connections{state="current"}'
+            legendFormat: 'Connections'
+          - expr: 'sum(rate(mongodb_collection_operations_total[5m]))'
+            legendFormat: 'Operations/s'
+          - expr: 'sum(rate(mongodb_query_duration_seconds_sum[5m]))/sum(rate(mongodb_query_duration_seconds_count[5m]))'
+            legendFormat: 'Avg Query Time'
+          - expr: 'sum(rate(mongodb_docs_examined_total[5m])) / sum(rate(mongodb_docs_returned_total[5m]))'
+            legendFormat: 'Docs Examined/Returned'
+      
+      # Row: Query Performance
+      - title: 'Query Performance'
+        type: 'row'
+        gridPos: { h: 1, w: 24, x: 0, y: 3 }
+        collapsed: false
+      
+      # Query Performance
+      - title: 'Query Duration by Collection (p95)'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 0, y: 4 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'histogram_quantile(0.95, sum(rate(mongodb_query_duration_seconds_bucket[5m])) by (collection, le))'
+            legendFormat: '{{collection}}'
+        fieldConfig:
+          defaults:
+            unit: 's'
+            color:
+              mode: 'palette-classic'
+        options:
+          legend:
+            showLegend: true
+            placement: 'bottom'
+          tooltip:
+            mode: 'multi'
+            sort: 'desc'
+      
+      # Query Latency Heatmap
+      - title: 'Query Latency Distribution'
+        type: 'heatmap'
+        gridPos: { h: 8, w: 12, x: 12, y: 4 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'sum(rate(mongodb_query_duration_seconds_bucket[5m])) by (le)'
+            format: 'heatmap'
+        fieldConfig:
+          defaults:
+            unit: 's'
+        options:
+          calculate: true
+          yAxis:
+            format: 's'
+            decimals: 3
+          color:
+            mode: 'scheme'
+            scheme: 'Spectral'
+          tooltip:
+            show: true
+            showHistogram: true
+      
+      # Operation Counts
+      - title: 'MongoDB Operations by Type'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 0, y: 12 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'sum(rate(mongodb_collection_operations_total[5m])) by (operation)'
+            legendFormat: '{{operation}}'
+        fieldConfig:
+          defaults:
+            unit: 'ops'
+            min: 0
+            color:
+              mode: 'palette-classic'
+        options:
+          legend:
+            showLegend: true
+            placement: 'bottom'
+          tooltip:
+            mode: 'multi'
+            sort: 'desc'
+      
+      # Operations by Collection
+      - title: 'Operations by Collection'
+        type: 'bar'
+        gridPos: { h: 8, w: 12, x: 12, y: 12 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'sum(rate(mongodb_collection_operations_total[5m])) by (collection)'
+            legendFormat: '{{collection}}'
+        fieldConfig:
+          defaults:
+            unit: 'ops'
+            min: 0
+            color:
+              mode: 'palette-classic'
+        options:
+          orientation: 'horizontal'
+          showValue: 'auto'
+      
+      # Row: I/O & Network Performance
+      - title: 'I/O & Network Performance'
+        type: 'row'
+        gridPos: { h: 1, w: 24, x: 0, y: 20 }
+        collapsed: false
+      
+      # I/O Performance
+      - title: 'Disk I/O'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 8, x: 0, y: 21 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'rate(mongodb_io_bytes_total{operation="read"}[5m])'
+            legendFormat: 'Read'
+          - expr: 'rate(mongodb_io_bytes_total{operation="write"}[5m])'
+            legendFormat: 'Write'
+        fieldConfig:
+          defaults:
+            unit: 'Bps'
+            min: 0
+            color:
+              mode: 'palette-classic'
+        options:
+          legend:
+            showLegend: true
+            placement: 'bottom'
+          tooltip:
+            mode: 'multi'
+      
+      # I/O Latency
+      - title: 'I/O Latency'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 8, x: 8, y: 21 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'rate(mongodb_io_latency_seconds_sum{operation="read"}[5m]) / rate(mongodb_io_latency_seconds_count{operation="read"}[5m])'
+            legendFormat: 'Read Latency'
+          - expr: 'rate(mongodb_io_latency_seconds_sum{operation="write"}[5m]) / rate(mongodb_io_latency_seconds_count{operation="write"}[5m])'
+            legendFormat: 'Write Latency'
+        fieldConfig:
+          defaults:
+            unit: 's'
+            min: 0
+            color:
+              mode: 'palette-classic'
+        options:
+          legend:
+            showLegend: true
+            placement: 'bottom'
+          tooltip:
+            mode: 'multi'
+      
+      # Network Performance
+      - title: 'Network Traffic'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 8, x: 16, y: 21 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'rate(mongodb_net_bytes_total{direction="ingress"}[5m])'
+            legendFormat: 'Ingress'
+          - expr: 'rate(mongodb_net_bytes_total{direction="egress"}[5m])'
+            legendFormat: 'Egress'
+        fieldConfig:
+          defaults:
+            unit: 'Bps'
+            min: 0
+            color:
+              mode: 'palette-classic'
+        options:
+          legend:
+            showLegend: true
+            placement: 'bottom'
+          tooltip:
+            mode: 'multi'
+      
+      # Row: Resource Utilization
+      - title: 'Resource Utilization'
+        type: 'row'
+        gridPos: { h: 1, w: 24, x: 0, y: 29 }
+        collapsed: false
+      
+      # Documents Examined vs Returned
+      - title: 'Query Efficiency (Docs Examined/Returned)'
+        type: 'gauge'
+        gridPos: { h: 8, w: 6, x: 0, y: 30 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'sum(rate(mongodb_docs_examined_total[5m])) / sum(rate(mongodb_docs_returned_total[5m]))'
+            legendFormat: 'Ratio'
+        fieldConfig:
+          defaults:
+            min: 1
+            max: 100
+            thresholds:
+              steps:
+                - color: 'green'
+                  value: null
+                - color: 'yellow'
+                  value: 20
+                - color: 'orange'
+                  value: 50
+                - color: 'red'
+                  value: 80
+            unit: 'none'
+        options:
+          orientation: 'auto'
+          showThresholdLabels: false
+          showThresholdMarkers: true
+      
+      # Memory Usage
+      - title: 'Memory Usage'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 6, x: 6, y: 30 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'mongodb_memory_bytes{type="resident"}'
+            legendFormat: 'Resident'
+          - expr: 'mongodb_memory_bytes{type="virtual"}'
+            legendFormat: 'Virtual'
+          - expr: 'mongodb_memory_bytes{type="mapped"}'
+            legendFormat: 'Mapped'
+          - expr: 'mongodb_memory_bytes{type="wiredTiger"}'
+            legendFormat: 'WiredTiger Cache'
+        fieldConfig:
+          defaults:
+            unit: 'bytes'
+            min: 0
+            color:
+              mode: 'palette-classic'
+        options:
+          legend:
+            showLegend: true
+            placement: 'bottom'
+          tooltip:
+            mode: 'multi'
+      
+      # CPU Usage
+      - title: 'CPU Usage'
+        type: 'gauge'
+        gridPos: { h: 8, w: 6, x: 12, y: 30 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'mongodb_cpu_percent'
+            legendFormat: 'CPU %'
+        fieldConfig:
+          defaults:
+            min: 0
+            max: 100
+            thresholds:
+              steps:
+                - color: 'green'
+                  value: null
+                - color: 'yellow'
+                  value: 50
+                - color: 'orange'
+                  value: 70
+                - color: 'red'
+                  value: 90
+            unit: 'percent'
+        options:
+          orientation: 'auto'
+          showThresholdLabels: false
+          showThresholdMarkers: true
+      
+      # Connection Status
+      - title: 'Connection Status'
+        type: 'stat'
+        gridPos: { h: 4, w: 6, x: 18, y: 30 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'mongodb_connections{state="current"}'
+            legendFormat: 'Current'
+          - expr: 'mongodb_connections{state="available"}'
+            legendFormat: 'Available'
+          - expr: 'mongodb_connections{state="active"}'
+            legendFormat: 'Active'
+        fieldConfig:
+          defaults:
+            color:
+              mode: 'thresholds'
+            thresholds:
+              steps:
+                - color: 'green'
+                  value: null
+                - color: 'yellow'
+                  value: 100
+                - color: 'red'
+                  value: 500
+      
+      # Connection Utilization
+      - title: 'Connection Utilization %'
+        type: 'gauge'
+        gridPos: { h: 4, w: 6, x: 18, y: 34 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: '100 * mongodb_connections{state="current"} / mongodb_connections{state="available"}'
+            legendFormat: 'Utilization'
+        fieldConfig:
+          defaults:
+            min: 0
+            max: 100
+            thresholds:
+              steps:
+                - color: 'green'
+                  value: null
+                - color: 'yellow'
+                  value: 50
+                - color: 'red'
+                  value: 80
+            unit: 'percent'
+      
+      # Row: Locks and Slow Queries
+      - title: 'Locks and Slow Queries'
+        type: 'row'
+        gridPos: { h: 1, w: 24, x: 0, y: 38 }
+        collapsed: false
+      
+      # Lock Wait Time
+      - title: 'Lock Wait Time'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 0, y: 39 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'rate(mongodb_locks[5m])'
+            legendFormat: '{{database}} - {{type}}'
+        fieldConfig:
+          defaults:
+            unit: 'none'
+            min: 0
+            color:
+              mode: 'palette-classic'
+      
+      # Lock Acquisition Count by Database
+      - title: 'Lock Acquisition Count by Database'
+        type: 'piechart'
+        gridPos: { h: 8, w: 12, x: 12, y: 39 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'sum(mongodb_locks) by (database)'
+            legendFormat: '{{database}}'
+        options:
+          legend:
+            showLegend: true
+            placement: 'right'
+          pieType: 'pie'
+          displayLabels: ['value', 'name']
+      
+      # Slow Queries
+      - title: 'Slow Queries (>100ms)'
+        type: 'table'
+        gridPos: { h: 10, w: 24, x: 0, y: 47 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'histogram_quantile(0.95, sum(rate(mongodb_query_duration_seconds_bucket{le="+Inf"}[5m]) - rate(mongodb_query_duration_seconds_bucket{le="0.1"}[5m])) by (collection, operation, le))'
+            format: 'table'
+        transformations:
+          - id: 'organize'
+            options:
+              excludeByName:
+                le: true
+              indexByName:
+                collection: 0
+                operation: 1
+                Value: 2
+              renameByName:
+                Value: 'Duration (s)'
+        fieldConfig:
+          defaults:
+            unit: 's'
+            color:
+              mode: 'thresholds'
+            thresholds:
+              steps:
+                - color: 'yellow'
+                  value: null
+                - color: 'orange'
+                  value: 0.5
+                - color: 'red'
+                  value: 1
+          overrides:
+            - matcher:
+                id: 'byName'
+                options: 'collection'
+              properties:
+                - id: 'custom.width'
+                  value: 200
+            - matcher:
+                id: 'byName'
+                options: 'operation'
+              properties:
+                - id: 'custom.width'
+                  value: 150
+      
+      # Query Stats by Collection
+      - title: 'Query Stats by Collection'
+        type: 'table'
+        gridPos: { h: 10, w: 24, x: 0, y: 57 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'sum(rate(mongodb_query_duration_seconds_count[5m])) by (collection)'
+            format: 'table'
+            legendFormat: 'QPS'
+          - expr: 'sum(rate(mongodb_docs_examined_total[5m])) by (collection)'
+            format: 'table'
+            legendFormat: 'Docs Examined/s'
+          - expr: 'sum(rate(mongodb_docs_returned_total[5m])) by (collection)'
+            format: 'table'
+            legendFormat: 'Docs Returned/s'
+          - expr: 'sum(rate(mongodb_docs_examined_total[5m])) by (collection) / sum(rate(mongodb_docs_returned_total[5m])) by (collection)'
+            format: 'table'
+            legendFormat: 'Docs Ratio'
+        transformations:
+          - id: 'organize'
+            options:
+              indexByName:
+                collection: 0
+                QPS: 1
+                'Docs Examined/s': 2
+                'Docs Returned/s': 3
+                'Docs Ratio': 4
+        fieldConfig:
+          defaults:
+            color:
+              mode: 'thresholds'
+            custom:
+              align: 'auto'
+          overrides:
+            - matcher:
+                id: 'byName'
+                options: 'Docs Ratio'
+              properties:
+                - id: 'custom.width'
+                  value: 150
+                - id: 'color'
+                  value:
+                    mode: 'thresholds'
+                    thresholds:
+                      steps:
+                        - color: 'green'
+                          value: null
+                        - color: 'yellow'
+                          value: 10
+                        - color: 'orange'
+                          value: 50
+                        - color: 'red'
+                          value: 100
+
+  - name: 'MongoDB WiredTiger Analysis'
+    uid: mongodb-wiredtiger
+    title: 'MongoDB WiredTiger Analysis'
+    tags: ['mongodb', 'ebpf', 'wiredtiger']
+    timezone: 'browser'
+    schemaVersion: 16
+    version: 1
+    refresh: '10s'
+    
+    panels:
+      # WiredTiger Cache Usage
+      - title: 'WiredTiger Cache Usage'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 0, y: 0 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'mongodb_wiredtiger_cache_bytes_currently_in_cache'
+            legendFormat: 'Current Cache Size'
+          - expr: 'mongodb_wiredtiger_cache_bytes_configured_max'
+            legendFormat: 'Max Cache Size'
+        fieldConfig:
+          defaults:
+            unit: 'bytes'
+            color:
+              mode: 'palette-classic'
+      
+      # WiredTiger Cache Hit Ratio
+      - title: 'WiredTiger Cache Hit Ratio'
+        type: 'gauge'
+        gridPos: { h: 8, w: 12, x: 12, y: 0 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: '100 * (1 - mongodb_wiredtiger_cache_pages_read / (mongodb_wiredtiger_cache_pages_requested + 1))'
+            legendFormat: 'Cache Hit Ratio'
+        fieldConfig:
+          defaults:
+            min: 0
+            max: 100
+            unit: 'percent'
+            thresholds:
+              steps:
+                - color: 'red'
+                  value: null
+                - color: 'yellow'
+                  value: 50
+                - color: 'green'
+                  value: 90
+      
+      # WiredTiger Block Manager Stats
+      - title: 'WiredTiger Block Operations'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 0, y: 8 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'rate(mongodb_wiredtiger_block_manager_blocks_read[5m])'
+            legendFormat: 'Blocks Read'
+          - expr: 'rate(mongodb_wiredtiger_block_manager_blocks_written[5m])'
+            legendFormat: 'Blocks Written'
+        fieldConfig:
+          defaults:
+            unit: 'blocks/s'
+            color:
+              mode: 'palette-classic'
+      
+      # WiredTiger Checkpoint Stats
+      - title: 'WiredTiger Checkpoint Time'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 12, y: 8 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'rate(mongodb_wiredtiger_checkpoint_time_seconds[5m])'
+            legendFormat: 'Checkpoint Time'
+        fieldConfig:
+          defaults:
+            unit: 's'
+            color:
+              mode: 'palette-classic'
+      
+      # WiredTiger Concurrent Transactions
+      - title: 'WiredTiger Concurrent Transactions'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 24, x: 0, y: 16 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'mongodb_wiredtiger_concurrent_transactions_active_read'
+            legendFormat: 'Active Read Transactions'
+          - expr: 'mongodb_wiredtiger_concurrent_transactions_active_write'
+            legendFormat: 'Active Write Transactions'
+          - expr: 'mongodb_wiredtiger_concurrent_transactions_read_tickets_available'
+            legendFormat: 'Read Tickets Available'
+          - expr: 'mongodb_wiredtiger_concurrent_transactions_write_tickets_available'
+            legendFormat: 'Write Tickets Available'
+        fieldConfig:
+          defaults:
+            color:
+              mode: 'palette-classic'
+      
+      # WiredTiger Session Performance
+      - title: 'WiredTiger Session Operations'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 0, y: 24 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'rate(mongodb_wiredtiger_session_open[5m])'
+            legendFormat: 'Sessions Opened'
+          - expr: 'rate(mongodb_wiredtiger_session_cursor_open[5m])'
+            legendFormat: 'Cursors Opened'
+        fieldConfig:
+          defaults:
+            unit: 'ops/s'
+            color:
+              mode: 'palette-classic'
+      
+      # WiredTiger Transaction Performance
+      - title: 'WiredTiger Transaction Performance'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 12, y: 24 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'rate(mongodb_wiredtiger_transactions_begins[5m])'
+            legendFormat: 'Transaction Begins'
+          - expr: 'rate(mongodb_wiredtiger_transactions_commits[5m])'
+            legendFormat: 'Transaction Commits'
+          - expr: 'rate(mongodb_wiredtiger_transactions_rollbacks[5m])'
+            legendFormat: 'Transaction Rollbacks'
+        fieldConfig:
+          defaults:
+            unit: 'ops/s'
+            color:
+              mode: 'palette-classic'
+
+  - name: 'MongoDB Replica Set Monitoring'
+    uid: mongodb-replicaset
+    title: 'MongoDB Replica Set Monitoring'
+    tags: ['mongodb', 'ebpf', 'replication']
+    timezone: 'browser'
+    schemaVersion: 16
+    version: 1
+    refresh: '10s'
+    
+    panels:
+      # Replication Status
+      - title: 'Replication Status'
+        type: 'stat'
+        gridPos: { h: 4, w: 24, x: 0, y: 0 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'mongodb_replset_member_state'
+            legendFormat: '{{instance}} - {{state}}'
+        fieldConfig:
+          defaults:
+            mappings:
+              - type: 'value'
+                options:
+                  '1': { text: 'STARTUP', color: 'yellow' }
+                  '2': { text: 'PRIMARY', color: 'green' }
+                  '3': { text: 'SECONDARY', color: 'blue' }
+                  '4': { text: 'RECOVERING', color: 'orange' }
+                  '5': { text: 'STARTUP2', color: 'yellow' }
+                  '6': { text: 'UNKNOWN', color: 'red' }
+                  '7': { text: 'ARBITER', color: 'purple' }
+                  '8': { text: 'DOWN', color: 'red' }
+                  '9': { text: 'ROLLBACK', color: 'orange' }
+                  '10': { text: 'REMOVED', color: 'red' }
+            color:
+              mode: 'thresholds'
+      
+      # Replication Lag
+      - title: 'Replication Lag'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 0, y: 4 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'mongodb_replset_member_replication_lag'
+            legendFormat: '{{instance}}'
+        fieldConfig:
+          defaults:
+            unit: 's'
+            color:
+              mode: 'palette-classic'
+            thresholds:
+              steps:
+                - color: 'green'
+                  value: null
+                - color: 'yellow'
+                  value: 10
+                - color: 'red'
+                  value: 60
+      
+      # Oplog Operations
+      - title: 'Oplog Operations'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 12, y: 4 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'rate(mongodb_oplog_operations_total[5m])'
+            legendFormat: 'Operations'
+        fieldConfig:
+          defaults:
+            unit: 'ops/s'
+            color:
+              mode: 'palette-classic'
+      
+      # Oplog Size
+      - title: 'Oplog Size and Window'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 12, x: 0, y: 12 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'mongodb_oplog_size_bytes'
+            legendFormat: 'Size'
+        fieldConfig:
+          defaults:
+            unit: 'bytes'
+            color:
+              mode: 'palette-classic'
+      
+      # Oplog Window
+      - title: 'Oplog Time Window'
+        type: 'gauge'
+        gridPos: { h: 8, w: 12, x: 12, y: 12 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'mongodb_oplog_window_hours'
+            legendFormat: 'Window'
+        fieldConfig:
+          defaults:
+            unit: 'h'
+            min: 0
+            max: 72
+            thresholds:
+              steps:
+                - color: 'red'
+                  value: null
+                - color: 'yellow'
+                  value: 12
+                - color: 'green'
+                  value: 24
+      
+      # Replica Set Elections
+      - title: 'Replica Set Elections'
+        type: 'timeseries'
+        gridPos: { h: 8, w: 24, x: 0, y: 20 }
+        datasource: 'Prometheus'
+        targets:
+          - expr: 'rate(mongodb_replset_elections_total[5m])'
+            legendFormat: 'Elections'
+          - expr: 'rate(mongodb_replset_elections_called_total[5m])'
+            legendFormat: 'Elections Called'
+          - expr: 'rate(mongodb_replset_elections_won_total[5m])'
+            legendFormat: 'Elections Won'
+        fieldConfig:
+          defaults:
+            color:
+              mode: 'palette-classic'
